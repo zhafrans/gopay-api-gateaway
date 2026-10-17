@@ -203,6 +203,71 @@ app.get('/token-status', apiKeyAuth, async (req, res) => {
     }
 });
 
+// Mengirimkan Callback / Webhook Notifikasi Pembayaran Sukses
+async function dispatchCallback(qris, transaction, retryCount = 3) {
+    const targetUrl = qris?.callbackUrl || process.env.CALLBACK_URL;
+    if (!targetUrl) {
+        logActivity('INFO', `Callback dilewati (CALLBACK_URL belum dikonfigurasi) untuk TRX ${qris?.trxId || transaction?.order_id || '-'}`);
+        return false;
+    }
+
+    if (qris && qris.callbackSent) {
+        return true; // Cegah double trigger
+    }
+
+    const payload = {
+        event: 'payment.success',
+        status: 'PAID',
+        timestamp: new Date().toISOString(),
+        data: {
+            qris_id: qris?.qrisId || null,
+            trx_id: qris?.trxId || null,
+            amount: transaction?.amount || qris?.amount || 0,
+            payment_type: transaction?.payment_type || 'QRIS',
+            issuer: transaction?.payer_issuer || 'GoPay / Bank',
+            order_id: transaction?.order_id || null,
+            transaction_id: transaction?.transaction_id || null,
+            settlement_time: transaction?.transaction_time || new Date().toISOString(),
+            custom_field: qris?.customField || null
+        }
+    };
+
+    for (let attempt = 1; attempt <= retryCount; attempt++) {
+        try {
+            logActivity('INFO', `Mengirim webhook callback ke ${targetUrl} (Percobaan ${attempt}/${retryCount})...`);
+            const response = await axios.post(targetUrl, payload, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'GoPay-Partner-Gateway-Webhook/1.0',
+                    'X-Gateway-Event': 'payment.success',
+                    'X-Gateway-Signature': calculateCRC16(JSON.stringify(payload))
+                },
+                timeout: 8000
+            });
+
+            if (response.status >= 200 && response.status < 300) {
+                if (qris) {
+                    qris.callbackSent = true;
+                    qris.callbackStatus = 'SUCCESS';
+                }
+                logActivity('SUCCESS', `Callback berhasil terkirim ke ${targetUrl} | HTTP ${response.status}`);
+                return true;
+            }
+        } catch (err) {
+            logActivity('WARNING', `Percobaan callback ${attempt} gagal: ${err.message}`);
+            if (attempt < retryCount) {
+                await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+            }
+        }
+    }
+
+    if (qris) {
+        qris.callbackStatus = 'FAILED';
+    }
+    logActivity('ERROR', `Gagal mengirim callback ke ${targetUrl} setelah ${retryCount} percobaan`);
+    return false;
+}
+
 // Buat QRIS Dinamis (Support GET query & POST body)
 app.all('/create-qris', apiKeyAuth, (req, res) => {
     const amount = req.body?.amount || req.query?.amount;
@@ -215,6 +280,9 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
         return res.status(500).json({ success: false, message: 'QRIS_STATIC belum dikonfigurasi di .env' });
     }
 
+    const callbackUrl = req.body?.callback_url || req.query?.callback_url || process.env.CALLBACK_URL || null;
+    const customField = req.body?.custom_field || req.query?.custom_field || req.body?.order_id || req.query?.order_id || null;
+
     const dynamicCode = generateDynamicQRIS(staticTemplate, amount);
     const qrisId = Math.random().toString(36).substring(2, 10);
     // TRX-ID unik per payment — dipakai sebagai scope klaim agar tidak tabrakan dengan payment lain
@@ -223,19 +291,24 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
     const createdAt = new Date();
 
     qrisStore.set(qrisId, {
+        qrisId,
         data: dynamicCode,
         amount: parseInt(amount, 10),
         trxId,
+        callbackUrl,
+        customField,
         expiresAt,
         createdAt,
-        status: 'PENDING'
+        status: 'PENDING',
+        callbackSent: false,
+        callbackStatus: null
     });
 
     const host = req.get('host');
     const protocol = req.protocol;
     const publicUrl = `${protocol}://${host}/qr/${qrisId}`;
 
-    logActivity('INFO', `QRIS Dinamis dibuat | TRX-ID: ${trxId} | Nominal: Rp ${amount}`);
+    logActivity('INFO', `QRIS Dinamis dibuat | TRX-ID: ${trxId} | Nominal: Rp ${amount}${callbackUrl ? ' | Callback: ' + callbackUrl : ''}`);
 
     res.json({
         success: true,
@@ -245,6 +318,8 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
             qris_url: publicUrl,
             qris_code: dynamicCode,
             amount: parseInt(amount, 10),
+            callback_url: callbackUrl,
+            custom_field: customField,
             expires_at: expiresAt.toISOString(),
             expires_in: '5 menit'
         }
@@ -533,14 +608,18 @@ app.get('/transactions', apiKeyAuth, async (req, res) => {
         }
 
         const rawTransactions = response.data?.transactions || response.data?.data?.transactions || [];
-        const formattedTransactions = rawTransactions.map(tx => ({
-            amount: parseInt(tx.gross_amount || tx.real_gross_amount || 0, 10),
-            status: tx.transaction_status ? tx.transaction_status.toLowerCase() : 'success',
-            time: tx.transaction_time || tx.settlement_time,
-            issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
-            order_id: tx.order_id,
-            transaction_id: tx.id
-        }));
+        const formattedTransactions = rawTransactions.map(tx => {
+            const raw = parseInt(tx.gross_amount || tx.real_gross_amount || 0, 10);
+            const amount = raw % 100 === 0 ? raw / 100 : raw;
+            return {
+                amount,
+                status: tx.transaction_status ? tx.transaction_status.toLowerCase() : 'success',
+                time: tx.transaction_time || tx.settlement_time,
+                issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
+                order_id: tx.order_id,
+                transaction_id: tx.id
+            };
+        });
 
         res.json({
             success: true,
@@ -613,7 +692,10 @@ async function verifyPayment(amount, startTime, merchantIdOverride = null, userA
     const filterStartTimeMs = startTime ? new Date(startTime).getTime() : 0;
 
     for (const tx of rawTransactions) {
-        const txAmount = parseInt(tx.gross_amount || tx.real_gross_amount || tx.amount?.value || tx.amount || 0, 10);
+        const rawAmount = parseInt(tx.gross_amount || tx.real_gross_amount || tx.amount?.value || tx.amount || 0, 10);
+        // API Gojek Merchant Analytics mengembalikan nominal dalam sen (dikali 100).
+        // Kita bandingkan jika txAmount dikonversi (rawAmount / 100) atau jika sudah dalam rupiah langsung.
+        const txAmount = (rawAmount / 100 === targetAmount) ? (rawAmount / 100) : rawAmount;
         const txTimestamp = new Date(tx.transaction_time || tx.created_at || tx.settlement_time || 0).getTime();
         const txId = tx.id || tx.order_id || tx.wallstreet_transaction_id;
 
@@ -677,6 +759,12 @@ app.get('/api/qr-status/:id', async (req, res) => {
             qris.transaction = matched;
             qrisStore.set(qrisId, qris);
             logActivity('SUCCESS', `Pembayaran QRIS ID ${qrisId} terverifikasi lunas untuk nominal Rp ${qris.amount}`);
+
+            // Kirim callback otomatis di background
+            dispatchCallback(qris, matched).catch(err => {
+                logActivity('ERROR', `Error saat eksekusi dispatchCallback QRIS ${qrisId}: ${err.message}`);
+            });
+
             return res.json({ success: true, paid: true, status: 'PAID', transaction: matched });
         }
         return res.json({ success: true, paid: false, status: 'PENDING', message: 'Belum ada pembayaran masuk' });
@@ -703,6 +791,27 @@ app.all('/check-payment', apiKeyAuth, async (req, res) => {
 
         if (matchedTransaction) {
             logActivity('SUCCESS', `Pembayaran terverifikasi lunas untuk nominal Rp ${parseInt(amount, 10)}`, matchedTransaction);
+
+            let matchedQris = null;
+            if (scopeId) {
+                for (const q of qrisStore.values()) {
+                    if (q.trxId === scopeId || q.qrisId === scopeId) {
+                        matchedQris = q;
+                        break;
+                    }
+                }
+            }
+
+            const callbackUrl = req.body?.callback_url || req.query?.callback_url || matchedQris?.callbackUrl || process.env.CALLBACK_URL || null;
+            if (matchedQris) {
+                matchedQris.status = 'PAID';
+                matchedQris.transaction = matchedTransaction;
+            }
+
+            dispatchCallback(matchedQris || { amount: parseInt(amount, 10), callbackUrl }, matchedTransaction).catch(err => {
+                logActivity('ERROR', `Error saat eksekusi dispatchCallback check-payment: ${err.message}`);
+            });
+
             return res.json({
                 success: true,
                 paid: true,
@@ -723,6 +832,66 @@ app.all('/check-payment', apiKeyAuth, async (req, res) => {
             message: 'Gagal mengambil data transaksi dari API GoPay',
             error: errorDetail
         });
+    }
+});
+
+// Background Worker: Otomatis memindai QRIS pending & mengirim callback secara mandiri
+async function autoScanPendingQRIS() {
+    if (qrisStore.size === 0) return;
+    const now = Date.now();
+
+    for (const [qrisId, qris] of qrisStore.entries()) {
+        if (qris.status === 'PENDING') {
+            if (now > qris.expiresAt.getTime()) {
+                qris.status = 'EXPIRED';
+                continue;
+            }
+            try {
+                const matched = await verifyPayment(qris.amount, qris.createdAt, null, null, qris.trxId || qrisId);
+                if (matched) {
+                    qris.status = 'PAID';
+                    qris.transaction = matched;
+                    qrisStore.set(qrisId, qris);
+                    logActivity('SUCCESS', `Auto-Poller: Pembayaran QRIS ${qrisId} terverifikasi lunas | Rp ${qris.amount}`);
+                    await dispatchCallback(qris, matched);
+                }
+            } catch (err) {
+                // Abaikan error koneksi sesaat di background worker
+            }
+        }
+    }
+}
+setInterval(autoScanPendingQRIS, 10000);
+
+// Endpoint Test Webhook Callback Manual
+app.all('/test-callback', apiKeyAuth, async (req, res) => {
+    const targetUrl = req.body?.callback_url || req.query?.callback_url || process.env.CALLBACK_URL;
+    if (!targetUrl) {
+        return res.status(400).json({ success: false, message: 'Harap sertakan ?callback_url=... atau set CALLBACK_URL di .env' });
+    }
+
+    const dummyQris = {
+        qrisId: 'test-' + Math.random().toString(36).substring(2, 8),
+        trxId: 'TRX-TEST-' + Math.random().toString(36).substring(2, 8).toUpperCase(),
+        amount: parseInt(req.body?.amount || req.query?.amount || '10000', 10),
+        callbackUrl: targetUrl,
+        customField: req.body?.custom_field || req.query?.custom_field || 'Test Order #123'
+    };
+
+    const dummyTx = {
+        transaction_id: 'test-gopay-tx-' + Date.now(),
+        order_id: 'QRIS-TEST-' + Date.now(),
+        amount: dummyQris.amount,
+        payer_issuer: 'BCA / GoPay Test',
+        payment_type: 'QRIS',
+        transaction_time: new Date().toISOString()
+    };
+
+    const sent = await dispatchCallback(dummyQris, dummyTx, 1);
+    if (sent) {
+        return res.json({ success: true, message: `Callback berhasil terkirim ke ${targetUrl}`, target_url: targetUrl, payload: dummyTx });
+    } else {
+        return res.status(500).json({ success: false, message: `Gagal mengirim callback ke ${targetUrl}`, target_url: targetUrl });
     }
 });
 
