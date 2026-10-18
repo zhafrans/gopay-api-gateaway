@@ -5,11 +5,12 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const sessionManager = require('./sessionManager');
+const redisService = require('./redisService');
 
 const PORT = process.env.PORT || 3000;
 const MAX_LOGS = 100;
 const CLAIMED_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 jam
-const QRIS_EXPIRY_MS = 5 * 60 * 1000; // 5 menit
+const QRIS_EXPIRY_MS = 1 * 60 * 1000; // 1 menit (60 detik)
 const GOJEK_TRANSACTIONS_URL = 'https://api.gojekapi.com/merchant-analytics/v2/merchants/transactions';
 
 
@@ -269,14 +270,30 @@ async function dispatchCallback(qris, transaction, retryCount = 3) {
 }
 
 // Buat QRIS Dinamis (Support GET query & POST body)
-app.all('/create-qris', apiKeyAuth, (req, res) => {
+app.all('/create-qris', apiKeyAuth, async (req, res) => {
     const amount = req.body?.amount || req.query?.amount;
     if (!amount || isNaN(amount) || amount <= 0) {
         return res.status(400).json({ success: false, message: 'Nominal pembayaran tidak valid (gunakan ?amount=...)' });
     }
 
+    const amountInt = parseInt(amount, 10);
+    const trxId = 'TRX-' + Math.random().toString(36).substring(2, 10).toUpperCase();
+
+    // 1. Coba pasang Atomic Lock di Redis untuk nominal ini selama 60 detik (1 menit)
+    const lockResult = await redisService.acquireAmountLock(amountInt, trxId, 60);
+    if (!lockResult.acquired) {
+        logActivity('WARNING', `Pembuatan QRIS ditolak: Nominal Rp ${amountInt} sedang aktif di transaksi lain (Sisa TTL: ${lockResult.ttl}s)`);
+        return res.status(429).json({
+            success: false,
+            locked: true,
+            retry_after: lockResult.ttl,
+            message: `Nominal Rp ${amountInt.toLocaleString('id-ID')} sedang dalam antrean transaksi lain. Mohon tunggu ${lockResult.ttl} detik atau coba lagi.`
+        });
+    }
+
     const staticTemplate = process.env.QRIS_STATIC;
     if (!staticTemplate) {
+        await redisService.releaseAmountLock(amountInt);
         return res.status(500).json({ success: false, message: 'QRIS_STATIC belum dikonfigurasi di .env' });
     }
 
@@ -285,15 +302,13 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
 
     const dynamicCode = generateDynamicQRIS(staticTemplate, amount);
     const qrisId = Math.random().toString(36).substring(2, 10);
-    // TRX-ID unik per payment — dipakai sebagai scope klaim agar tidak tabrakan dengan payment lain
-    const trxId = 'TRX-' + Math.random().toString(36).substring(2, 10).toUpperCase();
     const expiresAt = new Date(Date.now() + QRIS_EXPIRY_MS);
     const createdAt = new Date();
 
-    qrisStore.set(qrisId, {
+    const qrisData = {
         qrisId,
         data: dynamicCode,
-        amount: parseInt(amount, 10),
+        amount: amountInt,
         trxId,
         callbackUrl,
         customField,
@@ -302,7 +317,10 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
         status: 'PENDING',
         callbackSent: false,
         callbackStatus: null
-    });
+    };
+
+    qrisStore.set(qrisId, qrisData);
+    await redisService.saveQris(qrisId, qrisData, 300);
 
     const host = req.get('host');
     const protocol = req.protocol;
@@ -317,11 +335,11 @@ app.all('/create-qris', apiKeyAuth, (req, res) => {
             trx_id: trxId,
             qris_url: publicUrl,
             qris_code: dynamicCode,
-            amount: parseInt(amount, 10),
+            amount: amountInt,
             callback_url: callbackUrl,
             custom_field: customField,
             expires_at: expiresAt.toISOString(),
-            expires_in: '5 menit'
+            expires_in: '1 menit'
         }
     });
 });
@@ -395,8 +413,8 @@ app.get('/qr/:id', (req, res) => {
         </div>
 
         <div class="timer-box">
-            <span>Batas Waktu Pembayaran</span>
-            <span class="timer-val" id="timer-text">05:00</span>
+            <span>Batas Waktu Pembayaran (1 Menit)</span>
+            <span class="timer-val" id="timer-text">01:00</span>
         </div>
 
         <div class="status-badge status-pending" id="status-badge">
@@ -700,12 +718,18 @@ async function verifyPayment(amount, startTime, merchantIdOverride = null, userA
         const txId = tx.id || tx.order_id || tx.wallstreet_transaction_id;
 
         if (txAmount === targetAmount && txTimestamp >= filterStartTimeMs) {
-            const existingClaim = claimedTransactions.get(txId);
+            const redisClaim = await redisService.getClaimedTransaction(txId);
+            const existingClaim = claimedTransactions.get(txId) || (redisClaim ? { qrisId: redisClaim } : null);
 
             if (!existingClaim) {
-                // Transaksi belum diklaim siapapun → klaim sekarang
+                // Transaksi belum diklaim siapapun → klaim sekarang di in-memory & Redis
                 claimedTransactions.set(txId, { qrisId, claimedAt: Date.now() });
-                logActivity('INFO', `TRX ${txId} diklaim oleh QRIS ${qrisId || 'manual-check'}`);
+                await redisService.claimTransaction(txId, qrisId || 'manual-check', 86400);
+
+                // Langsung buka kunci nominal di Redis agar pembeli berikutnya bisa checkout
+                await redisService.releaseAmountLock(txAmount);
+
+                logActivity('INFO', `TRX ${txId} diklaim oleh QRIS ${qrisId || 'manual-check'}. Lock nominal Rp ${txAmount} dibuka.`);
                 return {
                     transaction_id: txId,
                     order_id: tx.order_id,
@@ -748,6 +772,8 @@ app.get('/api/qr-status/:id', async (req, res) => {
 
     if (Date.now() > qris.expiresAt.getTime()) {
         qrisStore.delete(qrisId);
+        await redisService.releaseAmountLock(qris.amount);
+        await redisService.updateQris(qrisId, { status: 'EXPIRED' });
         return res.json({ success: false, paid: false, status: 'EXPIRED', message: 'QRIS sudah kedaluwarsa' });
     }
 
@@ -758,6 +784,9 @@ app.get('/api/qr-status/:id', async (req, res) => {
             qris.status = 'PAID';
             qris.transaction = matched;
             qrisStore.set(qrisId, qris);
+            await redisService.releaseAmountLock(qris.amount);
+            await redisService.updateQris(qrisId, { status: 'PAID', transaction: matched });
+
             logActivity('SUCCESS', `Pembayaran QRIS ID ${qrisId} terverifikasi lunas untuk nominal Rp ${qris.amount}`);
 
             // Kirim callback otomatis di background
@@ -844,6 +873,8 @@ async function autoScanPendingQRIS() {
         if (qris.status === 'PENDING') {
             if (now > qris.expiresAt.getTime()) {
                 qris.status = 'EXPIRED';
+                await redisService.releaseAmountLock(qris.amount);
+                await redisService.updateQris(qrisId, { status: 'EXPIRED' });
                 continue;
             }
             try {
@@ -852,6 +883,8 @@ async function autoScanPendingQRIS() {
                     qris.status = 'PAID';
                     qris.transaction = matched;
                     qrisStore.set(qrisId, qris);
+                    await redisService.releaseAmountLock(qris.amount);
+                    await redisService.updateQris(qrisId, { status: 'PAID', transaction: matched });
                     logActivity('SUCCESS', `Auto-Poller: Pembayaran QRIS ${qrisId} terverifikasi lunas | Rp ${qris.amount}`);
                     await dispatchCallback(qris, matched);
                 }
